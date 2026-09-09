@@ -1,0 +1,6 @@
+node_modules
+.env
+uploads/cards/*
+uploads/products/*
+!uploads/cards/.gitkeep
+!uploads/products/.gitkeep
