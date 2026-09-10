@@ -21,10 +21,13 @@ CREATE TABLE IF NOT EXISTS entries (
   address TEXT,
 
   card_photo_paths JSON,              -- array of paths, e.g. ["cards/abc123.jpg", "cards/back456.jpg"]
-  product_photo_paths JSON,          -- array of paths, e.g. ["products/xyz.jpg"]
 
-  price_tiers JSON,                  -- [{quantity, price, unit}, ...]
-  remarks TEXT,
+  -- Each product photo now carries its OWN price tiers and remark, since a
+  -- single entry can have several different products with different
+  -- pricing. Shape: [{ photoPath, priceTiers: [{quantity,price,unit}], remarks }, ...]
+  products JSON,
+
+  remarks TEXT,  -- general notes about the MEETING, not tied to any one product
 
   entry_date DATE NOT NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

@@ -51,9 +51,9 @@ function rowToEntry(row) {
     wechat: row.wechat,
     address: row.address,
     cardPhotoPaths: asJson(row.card_photo_paths, []),
-    productPhotoPaths: asJson(row.product_photo_paths, []),
-    priceTiers: asJson(row.price_tiers, []),
-    remarks: row.remarks,
+    // Each element: { photoPath, priceTiers: [{quantity,price,unit}], remarks }
+    products: asJson(row.products, []),
+    remarks: row.remarks, // general meeting notes, not tied to any one product
     entryDate: formatDateOnly(row.entry_date),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -74,8 +74,23 @@ router.get('/', async (req, res) => {
   }
 });
 
-// POST /api/entries — create or update-by-localId (upsert), with optional photo files
-// multipart/form-data: fields as text, cardPhoto + productPhoto as files (both support multiple)
+// POST /api/entries — create or update-by-localId (upsert)
+//
+// multipart/form-data fields:
+//   localId, contactName, companyName, phones (JSON string), email, wechat,
+//   address, remarks, entryDate — plain text fields, same as before.
+//
+//   cardPhoto — 0+ files (business card photos, unchanged from before).
+//
+//   productsMeta — a JSON string: an array of { priceTiers, remarks,
+//     hasNewPhoto, existingPhotoPath } objects, ONE PER PRODUCT, in the
+//     same order the corresponding productPhoto files are attached (for
+//     entries whose photo hasn't changed since last sync, hasNewPhoto is
+//     false and existingPhotoPath carries the path already on the server —
+//     this lets a retry avoid re-uploading a file that's already there).
+//
+//   productPhoto — 0+ files, in order, one per product entry in
+//     productsMeta where hasNewPhoto is true.
 router.post(
   '/',
   upload.fields([
@@ -89,21 +104,35 @@ router.post(
       if (!localId) return res.status(400).json({ error: 'localId is required' });
 
       const cardFiles = req.files?.cardPhoto || [];
-      const productFiles = req.files?.productPhoto || [];
-
       const cardPhotoPaths = cardFiles.length
         ? cardFiles.map((f) => `cards/${f.filename}`)
         : b.cardPhotoPaths
         ? JSON.parse(b.cardPhotoPaths)
         : [];
 
-      const productPhotoPaths = productFiles.length
-        ? productFiles.map((f) => `products/${f.filename}`)
-        : b.productPhotoPaths
-        ? JSON.parse(b.productPhotoPaths)
-        : [];
+      const productFiles = req.files?.productPhoto || [];
+      const productsMeta = b.productsMeta ? JSON.parse(b.productsMeta) : [];
 
-      const priceTiers = b.priceTiers ? JSON.parse(b.priceTiers) : [];
+      // Walk productsMeta in order, pulling the next uploaded file for each
+      // slot that needs one, so files line up correctly with their
+      // matching price/remarks even though multer delivers files as one
+      // flat array separate from the text fields.
+      let fileCursor = 0;
+      const products = productsMeta.map((meta) => {
+        let photoPath;
+        if (meta.hasNewPhoto) {
+          const file = productFiles[fileCursor++];
+          photoPath = file ? `products/${file.filename}` : meta.existingPhotoPath || null;
+        } else {
+          photoPath = meta.existingPhotoPath || null;
+        }
+        return {
+          photoPath,
+          priceTiers: Array.isArray(meta.priceTiers) ? meta.priceTiers : [],
+          remarks: meta.remarks || '',
+        };
+      });
+
       const phones = b.phones ? JSON.parse(b.phones) : [];
 
       // Upsert by local_id: if the same device re-syncs the same entry
@@ -117,12 +146,12 @@ router.post(
         await pool.query(
           `UPDATE entries SET
             contact_name=?, company_name=?, phones=?, email=?, wechat=?, address=?,
-            card_photo_paths=?, product_photo_paths=?, price_tiers=?, remarks=?, entry_date=?
+            card_photo_paths=?, products=?, remarks=?, entry_date=?
            WHERE local_id=? AND user_id=?`,
           [
             b.contactName || '', b.companyName || '', JSON.stringify(phones),
             b.email || '', b.wechat || '', b.address || '',
-            JSON.stringify(cardPhotoPaths), JSON.stringify(productPhotoPaths), JSON.stringify(priceTiers),
+            JSON.stringify(cardPhotoPaths), JSON.stringify(products),
             b.remarks || '', b.entryDate,
             localId, req.userId,
           ]
@@ -131,13 +160,13 @@ router.post(
         await pool.query(
           `INSERT INTO entries
             (local_id, user_id, contact_name, company_name, phones, email, wechat, address,
-             card_photo_paths, product_photo_paths, price_tiers, remarks, entry_date)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             card_photo_paths, products, remarks, entry_date)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             localId, req.userId,
             b.contactName || '', b.companyName || '', JSON.stringify(phones),
             b.email || '', b.wechat || '', b.address || '',
-            JSON.stringify(cardPhotoPaths), JSON.stringify(productPhotoPaths), JSON.stringify(priceTiers),
+            JSON.stringify(cardPhotoPaths), JSON.stringify(products),
             b.remarks || '', b.entryDate,
           ]
         );
@@ -166,10 +195,8 @@ router.delete('/:localId', async (req, res) => {
     if (!entry) return res.status(404).json({ error: 'Entry not found' });
 
     // best-effort file cleanup; don't fail the request if a file is already gone
-    const filesToRemove = [
-      ...asJson(entry.card_photo_paths, []),
-      ...asJson(entry.product_photo_paths, []),
-    ].filter(Boolean);
+    const productPaths = asJson(entry.products, []).map((p) => p.photoPath).filter(Boolean);
+    const filesToRemove = [...asJson(entry.card_photo_paths, []), ...productPaths].filter(Boolean);
     for (const relPath of filesToRemove) {
       fs.unlink(path.join(UPLOADS_ROOT, relPath)).catch(() => {});
     }
